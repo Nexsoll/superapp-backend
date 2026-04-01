@@ -1,81 +1,85 @@
-import { Injectable, InternalServerErrorException, NotFoundException, ForbiddenException, BadRequestException } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
-import { GoogleGenerativeAI } from '@google/generative-ai';
-import { BookingStatus } from '@prisma/client';
-
-import { PrismaService } from 'prisma/prisma.service';
+import {
+  BadRequestException,
+  ForbiddenException,
+  Injectable,
+  InternalServerErrorException,
+  NotFoundException,
+} from '@nestjs/common';
+import { PrismaService } from '../../prisma/prisma.service';
 import { CreatePropertyDto } from './dto/create-property.dto';
 import { UpdatePropertyDto } from './dto/update-property.dto';
 import { CreateHotelDto } from './dto/create-hotel.dto';
 import { UpdateHotelDto } from './dto/update-hotel.dto';
-import { CreateRoomDto } from './dto/create-room.dto';
+import { BookingStatus, Currency, ListingType, PropertyType, Room } from '@prisma/client';
 import { CreateHotelBookingDto } from './dto/create-hotel-booking.dto';
 
 @Injectable()
 export class ListingService {
-  // Cache analysis results per property (key = propertyId)
-  private analysisCache = new Map<number, { data: any; timestamp: number }>();
-  private readonly CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
+  constructor(private readonly prisma: PrismaService) {}
 
-  constructor(
-    private prisma: PrismaService,
-    private configService: ConfigService,
-  ) { }
+  async getOwnerListingSummary(uId: number) {
+    const properties = await this.prisma.property.count({
+      where: { ownerId: uId },
+    });
+    const hotels = await this.prisma.hotel.count({
+      where: { ownerId: uId },
+    });
+    const bookings = await this.prisma.booking.count({
+      where: {
+        OR: [{ hotel: { ownerId: uId } }, { property: { ownerId: uId } }],
+      },
+    });
 
-  async getOwnerListingSummary(ownerId: number) {
-    const [activeProperties, activeHotels] = await Promise.all([
-      this.prisma.property.count({ where: { ownerId, isActive: true } }),
-      this.prisma.hotel.count({ where: { ownerId, isActive: true } }),
-    ]);
+    // Calculate total revenue from completed bookings
+    const completedBookings = await this.prisma.booking.findMany({
+      where: {
+        OR: [{ hotel: { ownerId: uId } }, { property: { ownerId: uId } }],
+        status: BookingStatus.COMPLETED,
+      },
+      select: { totalPrice: true },
+    });
+
+    const totalRevenue = completedBookings.reduce(
+      (sum, b) => sum + Number(b.totalPrice),
+      0,
+    );
 
     return {
-      activeProperties,
-      activeHotels,
-      activeListings: activeProperties + activeHotels,
+      properties,
+      hotels,
+      bookings,
+      totalRevenue,
     };
   }
 
   // ─── Properties ────────────────────────────────────────
-  async createProperty(data: CreatePropertyDto, uId: number) {
-    try {
-      const property = await this.prisma.property.create({
-        data: {
-          ...data,
-          owner: {
-            connect: { id: uId },
-          },
-        },
-      });
 
-      return { success: true, message: 'Property created successfully', property };
-    } catch (error) {
-      throw new InternalServerErrorException(error?.message);
-    }
+  async createProperty(dto: CreatePropertyDto, uId: number) {
+    return this.prisma.property.create({
+      data: {
+        ...dto,
+        owner: {
+          connect: { id: uId },
+        },
+      },
+    });
   }
 
   async getAllProperties() {
     return this.prisma.property.findMany({
       include: {
-        reviews: true,
-        owner: {
-          select: {
-            id: true,
-            firstName: true,
-            lastName: true,
-            fullName: true,
-            email: true,
-            avatar: true,
-          }
-        }
-      },
-    });
-  }
-
-  async getMyProperties(uId: number) {
-    return this.prisma.property.findMany({
-      where: { ownerId: uId },
-      include: {
-        reviews: true,
+        reviews: {
+          include: {
+            user: {
+              select: {
+                id: true,
+                firstName: true,
+                fullName: true,
+                avatar: true,
+              },
+            },
+          },
+        },
         owner: {
           select: {
             id: true,
@@ -91,11 +95,43 @@ export class ListingService {
     });
   }
 
+  async getMyProperties(uId: number) {
+    return this.prisma.property.findMany({
+      where: { ownerId: uId },
+      include: {
+        reviews: {
+          include: {
+            user: {
+              select: {
+                id: true,
+                firstName: true,
+                fullName: true,
+                avatar: true,
+              },
+            },
+          },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+  }
+
   async getPropertyById(id: number) {
     const property = await this.prisma.property.findUnique({
       where: { id },
       include: {
-        reviews: true,
+        reviews: {
+          include: {
+            user: {
+              select: {
+                id: true,
+                firstName: true,
+                fullName: true,
+                avatar: true,
+              },
+            },
+          },
+        },
         owner: {
           select: {
             id: true,
@@ -114,7 +150,7 @@ export class ListingService {
     return property;
   }
 
-  async updateProperty(id: number, data: UpdatePropertyDto, uId: number) {
+  async updateProperty(id: number, data: UpdatePropertyDto | { isActive: boolean }, uId: number) {
     const property = await this.prisma.property.findUnique({ where: { id } });
     if (!property) {
       throw new NotFoundException('Property not found');
@@ -123,12 +159,10 @@ export class ListingService {
       throw new ForbiddenException('You do not own this property');
     }
 
-    const updated = await this.prisma.property.update({
+    return this.prisma.property.update({
       where: { id },
       data,
     });
-
-    return { success: true, message: 'Property updated successfully', property: updated };
   }
 
   async deleteProperty(id: number, uId: number) {
@@ -174,14 +208,43 @@ export class ListingService {
 
   async getAllHotels() {
     return this.prisma.hotel.findMany({
-      include: { rooms: true },
+      include: {
+        rooms: true,
+        reviews: {
+          include: {
+            user: {
+              select: {
+                id: true,
+                firstName: true,
+                fullName: true,
+                avatar: true,
+              },
+            },
+          },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
     });
   }
 
   async getMyHotels(uId: number) {
     return this.prisma.hotel.findMany({
       where: { ownerId: uId },
-      include: { rooms: true },
+      include: {
+        rooms: true,
+        reviews: {
+          include: {
+            user: {
+              select: {
+                id: true,
+                firstName: true,
+                fullName: true,
+                avatar: true,
+              },
+            },
+          },
+        },
+      },
       orderBy: { createdAt: 'desc' },
     });
   }
@@ -189,7 +252,21 @@ export class ListingService {
   async getHotelById(id: number) {
     const hotel = await this.prisma.hotel.findUnique({
       where: { id },
-      include: { rooms: true, reviews: true },
+      include: {
+        rooms: true,
+        reviews: {
+          include: {
+            user: {
+              select: {
+                id: true,
+                firstName: true,
+                fullName: true,
+                avatar: true,
+              },
+            },
+          },
+        },
+      },
     });
     if (!hotel) {
       throw new NotFoundException('Hotel not found');
@@ -197,7 +274,7 @@ export class ListingService {
     return hotel;
   }
 
-  async updateHotel(id: number, data: UpdateHotelDto, uId: number, rooms: { id?: number; title: string; price: number; image?: string }[] = []) {
+  async updateHotel(id: number, data: UpdateHotelDto | { isActive: boolean }, uId: number, rooms: { id?: number; title: string; price: number; image?: string }[] = []) {
     const hotel = await this.prisma.hotel.findUnique({
       where: { id },
       include: { rooms: true }
@@ -248,20 +325,13 @@ export class ListingService {
           });
         }
       }
-
-      // 3. Update hotel data
-      await tx.hotel.update({
-        where: { id },
-        data,
-      });
     });
 
-    const updated = await this.prisma.hotel.findUnique({
+    return this.prisma.hotel.update({
       where: { id },
-      include: { rooms: true },
+      data: data as any,
+      include: { rooms: true }
     });
-
-    return { success: true, message: 'Hotel updated successfully', hotel: updated };
   }
 
   async deleteHotel(id: number, uId: number) {
@@ -277,57 +347,56 @@ export class ListingService {
     return { success: true, message: 'Hotel deleted successfully' };
   }
 
-  // ─── Rooms ─────────────────────────────────────────────
-  async addRoom(
-    createRoomDto: CreateRoomDto,
-    ownerId: string,
-    hotelId: string,
-  ) {
-    try {
-      const room = await this.prisma.room.create({
-        data: {
-          ...createRoomDto,
-          hotel: {
-            connect: {
-              id: Number(hotelId),
-            },
-          },
-        },
-      });
-      return room;
-    } catch (error) {
-      throw new InternalServerErrorException(error.message);
-    }
-  }
-
   async getRoomById(id: number) {
     return this.prisma.room.findUnique({ where: { id } });
   }
 
-  async createHotelBooking(data: CreateHotelBookingDto, userId: number) {
-    const checkIn = new Date(data.checkIn);
-    const checkOut = new Date(data.checkOut);
+  // ─── AI Analysis ─────────────────────────────────────────
 
-    if (Number.isNaN(checkIn.getTime()) || Number.isNaN(checkOut.getTime())) {
-      throw new BadRequestException('Invalid check-in or check-out date');
-    }
+  async analyzeProperty(id: number) {
+    const property = await this.prisma.property.findUnique({
+      where: { id },
+    });
+    if (!property) throw new NotFoundException('Property not found');
 
-    if (checkOut <= checkIn) {
-      throw new BadRequestException('Check-out must be after check-in');
-    }
+    // Currently returns mock insights
+    // In a real app, this would call GPT or similar for analysis
+    return {
+      id: property.id,
+      insights: [
+        {
+          label: 'High Rental Yield',
+          value: '8.5%',
+          trend: 'up',
+          description: 'Based on current area trends',
+        },
+        {
+          label: 'Area Demand',
+          value: 'High',
+          trend: 'up',
+          description: 'Increasing interest in this neighborhood',
+        },
+        {
+          label: 'Price per SqFt',
+          value: `$${(Number(property.price) / (property.area || 1000)).toFixed(2)}`,
+          trend: 'stable',
+          description: 'Competitive for recently sold properties',
+        },
+      ],
+      prediction: {
+        nextYear: '+12%',
+        confidence: '85%',
+      },
+    };
+  }
 
-    if (!data.rooms || data.rooms.length === 0) {
-      throw new BadRequestException('At least one room is required');
-    }
+  // ─── Bookings ────────────────────────────────────────────
 
-    const roomQuantityMap = new Map<number, number>();
-    for (const roomSelection of data.rooms) {
-      const prevQty = roomQuantityMap.get(roomSelection.roomId) ?? 0;
-      roomQuantityMap.set(roomSelection.roomId, prevQty + roomSelection.quantity);
-    }
+  async createHotelBooking(dto: CreateHotelBookingDto, userId: number) {
+    const { hotelId, checkIn, checkOut, rooms } = dto;
 
     const hotel = await this.prisma.hotel.findUnique({
-      where: { id: data.hotelId },
+      where: { id: hotelId },
       include: { rooms: true },
     });
 
@@ -335,48 +404,23 @@ export class ListingService {
       throw new NotFoundException('Hotel not found');
     }
 
-    const roomById = new Map(hotel.rooms.map((room) => [room.id, room]));
-    const selectedRoomIds = [...roomQuantityMap.keys()];
-    const invalidRoomIds = selectedRoomIds.filter((roomId) => !roomById.has(roomId));
-
-    if (invalidRoomIds.length > 0) {
-      throw new BadRequestException('One or more selected rooms are invalid for this hotel');
-    }
-
-    const overlappingBookings = await this.prisma.booking.findMany({
-      where: {
-        roomId: { in: selectedRoomIds },
-        status: BookingStatus.ACTIVE,
-        checkIn: { lt: checkOut },
-        checkOut: { gt: checkIn },
-      },
-      select: { roomId: true },
-    });
-
-    if (overlappingBookings.length > 0) {
-      const unavailableRoomIds = overlappingBookings
-        .map((booking) => booking.roomId)
-        .filter((roomId): roomId is number => roomId !== null);
-      const unavailableTitles = unavailableRoomIds
-        .map((roomId) => roomById.get(roomId)?.title)
-        .filter((title): title is string => !!title);
-
-      throw new BadRequestException(
-        unavailableTitles.length > 0
-          ? `Selected room(s) are not available: ${unavailableTitles.join(', ')}`
-          : 'Some selected rooms are not available for the selected dates',
-      );
-    }
-
+    const checkInDate = new Date(checkIn);
+    const checkOutDate = new Date(checkOut);
     const nights = Math.ceil(
-      (checkOut.getTime() - checkIn.getTime()) / (1000 * 60 * 60 * 24),
+      (checkOutDate.getTime() - checkInDate.getTime()) / (1000 * 60 * 60 * 24),
     );
+
     if (nights <= 0) {
-      throw new BadRequestException('Selected stay duration is invalid');
+      throw new BadRequestException('Check-out must be after check-in');
     }
 
+    // Calculate total price and prepare room creation data
     let totalPrice = 0;
     let totalRooms = 0;
+    const roomById = new Map(hotel.rooms.map((r) => [r.id, r]));
+    const selectedRoomIds = rooms.map((r) => r.roomId);
+    const roomQuantityMap = new Map(rooms.map((r) => [r.roomId, r.quantity]));
+
     const bookingData: {
       userId: number;
       hotelId: number;
@@ -388,7 +432,7 @@ export class ListingService {
     }[] = [];
 
     for (const roomId of selectedRoomIds) {
-      const room = roomById.get(roomId)!;
+      const room = roomById.get(roomId) as Room;
       const quantity = roomQuantityMap.get(roomId)!;
       const roomTotal = Number(room.price) * nights;
 
@@ -400,8 +444,8 @@ export class ListingService {
           userId,
           hotelId: hotel.id,
           roomId,
-          checkIn,
-          checkOut,
+          checkIn: checkInDate,
+          checkOut: checkOutDate,
           totalPrice: roomTotal,
           status: BookingStatus.PENDING,
         });
@@ -421,141 +465,130 @@ export class ListingService {
 
     return {
       success: true,
-      message: 'Hotel booking created successfully',
-      bookingGroup: {
-        hotelId: hotel.id,
-        hotelTitle: hotel.title,
-        checkIn,
-        checkOut,
-        nights,
-        totalRooms,
-        totalPrice,
-        bookings,
-      },
+      message: 'Booking request sent',
+      totalPrice,
+      totalRooms,
+      bookings,
     };
   }
 
-  // ─── AI Property Analysis ─────────────────────────────
-  async analyzeProperty(propertyId: number) {
-    // Check cache first
-    const cached = this.analysisCache.get(propertyId);
-    if (cached && Date.now() - cached.timestamp < this.CACHE_TTL) {
-      return cached.data;
-    }
-
-    const property = await this.prisma.property.findUnique({
-      where: { id: propertyId },
-      include: { reviews: true },
+  async getUserBookings(userId: number) {
+    const bookings = await this.prisma.booking.findMany({
+      where: { userId },
+      include: {
+        hotel: { select: { id: true, title: true, address: true, images: true } },
+        property: {
+          select: { id: true, title: true, address: true, images: true },
+        },
+        room: { select: { id: true, title: true, price: true, image: true } },
+      },
+      orderBy: { createdAt: 'desc' },
     });
-    if (!property) {
-      throw new NotFoundException('Property not found');
+
+    const now = new Date();
+
+    return bookings.map((booking) => {
+      const isHotel = booking.hotelId !== null;
+      const checkInDate = new Date(booking.checkIn);
+      const checkOutDate = new Date(booking.checkOut);
+
+      // A booking is past if checkout date has passed
+      const isPast = checkOutDate < now;
+
+      // A booking is upcoming if check-in is in the future or currently ongoing
+      const isUpcoming = checkInDate > now || (checkInDate <= now && checkOutDate >= now);
+
+      return {
+        id: booking.id,
+        bookingReference: `BK${booking.id.toString().padStart(5, '0')}`,
+        type: isHotel ? 'hotel' : 'property',
+        status: booking.status,
+        title: isHotel ? booking.hotel?.title : booking.property?.title,
+        location: isHotel ? booking.hotel?.address : booking.property?.address,
+        imageUrl: isHotel ? (booking.hotel?.images?.[0] || null) : (booking.property?.images?.[0] || null),
+        hotelId: booking.hotelId,
+        propertyId: booking.propertyId,
+        checkIn: booking.checkIn,
+        checkOut: booking.checkOut,
+        totalPrice: booking.totalPrice,
+        room: booking.room,
+        isPast,
+        isUpcoming,
+        createdAt: booking.createdAt,
+      };
+    });
+  }
+
+  async cancelBooking(bookingId: number, userId: number) {
+    const booking = await this.prisma.booking.findFirst({
+      where: {
+        id: bookingId,
+        userId,
+      },
+    });
+
+    if (!booking) {
+      throw new NotFoundException('Booking not found');
     }
 
-    const price = Number(property.price);
-    const area = property.area ?? 0;
-    const pricePerSqft = area > 0 ? (price / area).toFixed(2) : 'N/A';
-    const avgRating =
-      property.reviews.length > 0
-        ? (
-          property.reviews.reduce((sum, r) => sum + r.rating, 0) /
-          property.reviews.length
-        ).toFixed(1)
-        : 'No reviews';
+    if (booking.status === 'CANCELLED') {
+      throw new BadRequestException('Booking is already cancelled');
+    }
 
-    const prompt = `You are an expert real-estate investment analyst AI.
-Analyze the following property and return a JSON object with investment predictions.
+    // Determine refund amount based on 24hr rule (relative to when booking was placed)
+    const now = new Date();
+    const bookingTime = new Date(booking.createdAt);
+    const msDiff = now.getTime() - bookingTime.getTime();
+    const hoursDiff = msDiff / (1000 * 60 * 60);
 
-PROPERTY DATA:
-- Title: ${property.title}
-- Price: $${price.toLocaleString()}
-- Area: ${area} sqft
-- Price per sqft: $${pricePerSqft}
-- Rooms: ${property.rooms ?? 'N/A'}
-- Bathrooms: ${property.bathrooms ?? 'N/A'}
-- Type: ${property.type ?? 'Unknown'}
-- Location: ${property.address ?? 'Unknown'}
-- Amenities: ${property.amenities.join(', ') || 'None listed'}
-- Neighborhood insights: ${(property as any).neighborhoodInsights?.join(', ') || 'None'}
-- Average rating: ${avgRating}
-- Number of reviews: ${property.reviews.length}
+    let refundAmount = Number(booking.totalPrice);
+    let feeAmount = 0;
 
-Based on this data, predict:
-1. projectedROI — expected annual return on investment as a percentage (e.g. "+8.5%")
-2. priceTrend — year-over-year price trend (e.g. "↑6% YoY" or "↓2% YoY")
-3. riskLevel — "Low", "Medium", or "High"
-4. rentalYield — estimated annual rental yield percentage (e.g. "5.2%")
-5. summary — a one-line insight about the investment (max 80 chars)
+    if (hoursDiff > 24) {
+      feeAmount = refundAmount * 0.05;
+      refundAmount -= feeAmount;
+    }
 
-Return ONLY valid JSON, no markdown, no explanation:
-{"projectedROI": "...", "priceTrend": "...", "riskLevel": "...", "rentalYield": "...", "summary": "..."}`;
-
-    try {
-      const apiKey = this.configService.get<string>('GEMINI_API_KEY') || '';
-      if (!apiKey) {
-        throw new Error('No Gemini API key configured');
-      }
-
-      const genAI = new GoogleGenerativeAI(apiKey);
-      const model = genAI.getGenerativeModel({
-        model: 'gemini-3-flash-preview',
-        generationConfig: { temperature: 0 },
+    // Use a transaction to ensure atomic update
+    const result = await this.prisma.$transaction(async (tx) => {
+      // 1. Update booking status
+      const updatedBooking = await tx.booking.update({
+        where: { id: bookingId },
+        data: { status: 'CANCELLED' },
       });
 
-      const genResult = await model.generateContent(prompt);
-      const text = genResult.response.text().trim();
+      // 2. Update user balance
+      await tx.user.update({
+        where: { id: userId },
+        data: {
+          balance: {
+            increment: refundAmount,
+          },
+        },
+      });
 
-      // Extract JSON from the response (handle potential markdown wrapping)
-      const jsonMatch = text.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) {
-        throw new Error('No JSON found in Gemini response');
-      }
+      // 3. Create transaction record
+      await tx.transaction.create({
+        data: {
+          userId,
+          bookingId,
+          type: 'BOOKING_REFUND',
+          amount: refundAmount,
+          description: hoursDiff > 24 
+            ? `Refund for booking #${bookingId} (5% cancellation fee applied)` 
+            : `Full refund for booking #${bookingId}`,
+        },
+      });
 
-      const analysis = JSON.parse(jsonMatch[0]);
+      return updatedBooking;
+    });
 
-      const analysisResult = {
-        projectedROI: analysis.projectedROI ?? '+5.0%',
-        priceTrend: analysis.priceTrend ?? '↑3% YoY',
-        riskLevel: analysis.riskLevel ?? 'Medium',
-        rentalYield: analysis.rentalYield ?? '4.0%',
-        summary: analysis.summary ?? 'Stable investment opportunity.',
-        source: 'gemini-ai',
-      };
-
-      // Store in cache
-      this.analysisCache.set(propertyId, { data: analysisResult, timestamp: Date.now() });
-      return analysisResult;
-    } catch (error) {
-      // Fallback: heuristic-based analysis when AI is unavailable
-      console.warn('Gemini AI analysis failed, using heuristic fallback:', error?.message);
-
-      const hasGoodAmenities = property.amenities.length >= 3;
-      const hasGoodLocation = ((property as any).neighborhoodInsights?.length ?? 0) >= 2;
-      const isLargeProperty = area > 1500;
-      const isAffordable = price < 500000;
-
-      let roiBase = 4.0;
-      if (hasGoodAmenities) roiBase += 1.5;
-      if (hasGoodLocation) roiBase += 2.0;
-      if (isLargeProperty) roiBase += 1.0;
-      if (isAffordable) roiBase += 0.5;
-      if (property.reviews.length > 0 && parseFloat(avgRating) >= 4.0) roiBase += 1.0;
-
-      const trendBase = roiBase * 0.7;
-      const rentalYieldBase = 3.0 + (roiBase * 0.3);
-      const riskLevel = roiBase >= 7 ? 'Low' : roiBase >= 5 ? 'Medium' : 'High';
-
-      const fallbackResult = {
-        projectedROI: `+${roiBase.toFixed(1)}%`,
-        priceTrend: `↑${trendBase.toFixed(0)}% YoY`,
-        riskLevel,
-        rentalYield: `${rentalYieldBase.toFixed(1)}%`,
-        summary: `${riskLevel}-risk property with ${hasGoodAmenities ? 'strong' : 'basic'} amenities.`,
-        source: 'heuristic',
-      };
-
-      // Store fallback in cache too
-      this.analysisCache.set(propertyId, { data: fallbackResult, timestamp: Date.now() });
-      return fallbackResult;
-    }
+    return { 
+      success: true, 
+      message: 'Booking cancelled successfully', 
+      refundAmount: refundAmount.toFixed(2), 
+      feeAmount: feeAmount.toFixed(2),
+      booking: result
+    };
   }
 }

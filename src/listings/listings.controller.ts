@@ -424,6 +424,18 @@ export class ListingController {
     return this.listingService.createHotelBooking(dto, user.id);
   }
 
+  @UseGuards(AuthGuard('jwt'))
+  @Get('bookings')
+  getUserBookings(@GetUser() user: User) {
+    return this.listingService.getUserBookings(user.id);
+  }
+
+  @UseGuards(AuthGuard('jwt'))
+  @Post('bookings/:id/cancel')
+  cancelBooking(@Param('id') id: string, @GetUser() user: User) {
+    return this.listingService.cancelBooking(parseInt(id), user.id);
+  }
+
   // ─── Avatar image proxy (GCS bucket is private) ───────
   @Get('avatar-image/:filename')
   async getAvatarImage(

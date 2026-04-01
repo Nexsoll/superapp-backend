@@ -1,4 +1,5 @@
 import { Global, Module } from '@nestjs/common';
+import { ConfigModule } from '@nestjs/config';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { AuthModule } from './auth/auth.module';
@@ -16,10 +17,14 @@ import { ExpensesModule } from './expenses/expenses.module';
 import { StaffModule } from './staff/staff.module';
 import { IoTModule } from './iot/iot.module';
 import { NotificationsModule } from './notifications/notifications.module';
+import { PaymentsModule } from './payments/payments.module';
 
 @Global()
 @Module({
   imports: [
+    ConfigModule.forRoot({
+      isGlobal: true,
+    }),
     PrismaModule,
     AuthModule,
     UsersModule,
@@ -35,6 +40,7 @@ import { NotificationsModule } from './notifications/notifications.module';
     StaffModule,
     IoTModule,
     NotificationsModule,
+    PaymentsModule,
   ],
   controllers: [AppController],
   providers: [AppService],

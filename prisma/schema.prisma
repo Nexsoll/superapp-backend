@@ -116,6 +116,7 @@ model User {
 
   isProfileComplete Boolean @default(false)
   isActive          Boolean @default(true)
+  balance           Decimal @default(0) @db.Decimal(10, 2)
 
   // Relations
   properties Property[]
@@ -127,6 +128,7 @@ model User {
   forumLikes ForumLike[]
   forumComments ForumComment[]
   expenses   Expense[]
+  transactions Transaction[]
 
   ownedJobs       Job[]           @relation("JobOwner")
   jobAssignments  JobAssignment[] @relation("JobApplier")
@@ -319,6 +321,8 @@ model Booking {
 
   status BookingStatus @default(PENDING)
 
+  transactions Transaction[]
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -345,8 +349,6 @@ model Wishlist {
   @@unique([userId, propertyId])
   @@unique([userId, hotelId])
   @@index([userId])
-  @@index([propertyId])
-  @@index([hotelId])
 }
 
 model Forum {
@@ -528,4 +530,29 @@ model IoTDevice {
   updatedAt DateTime @updatedAt
 
   @@index([ownerId])
+}
+
+enum TransactionType {
+  BOOKING_PAYMENT
+  BOOKING_REFUND
+  WALLET_TOPUP
+  WITHDRAWAL
+}
+
+model Transaction {
+  id          Int             @id @default(autoincrement())
+  userId      Int
+  user        User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  type        TransactionType
+  amount      Decimal         @db.Decimal(10, 2)
+  description String
+  
+  bookingId   Int?
+  booking     Booking?        @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+  
+  createdAt   DateTime        @default(now())
+  
+  @@index([userId])
+  @@index([bookingId])
 }
