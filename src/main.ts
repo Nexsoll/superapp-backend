@@ -62,6 +62,16 @@ async function bootstrap() {
       credential: admin.credential.cert(adminConfig),
     });
     logger.log('✅ Firebase Admin initialized');
+  } else if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+    try {
+      const adminConfig = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON) as ServiceAccount;
+      admin.initializeApp({
+        credential: admin.credential.cert(adminConfig),
+      });
+      logger.log('✅ Firebase Admin initialized (from env var)');
+    } catch (e) {
+      logger.error(`❌ Firebase Admin init failed from env var: ${e}`);
+    }
   } else {
     try {
       admin.initializeApp({
