@@ -2,7 +2,9 @@ import {
   BadRequestException,
   Controller,
   Post,
+  Get,
   Body,
+  Query,
   UseGuards,
   UploadedFile,
   UseInterceptors,
@@ -17,6 +19,18 @@ import { FileInterceptor } from '@nestjs/platform-express';
 @Controller('ai-assistant')
 export class AiAssistantController {
   constructor(private readonly aiAssistantService: AiAssistantService) {}
+
+  @Get('recommendations')
+  @UseGuards(AuthGuard('jwt'))
+  async getRecommendations(@Query('type') type?: string) {
+    return this.aiAssistantService.getRandomRecommendations(type);
+  }
+
+  @Get('investment-announcement')
+  @UseGuards(AuthGuard('jwt'))
+  async getInvestmentAnnouncement(@GetUser() user: User) {
+    return this.aiAssistantService.getInvestmentAnnouncement(user.id);
+  }
 
   @Post('chat')
   @UseGuards(AuthGuard('jwt'))

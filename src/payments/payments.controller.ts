@@ -4,6 +4,7 @@ import type { User } from '@prisma/client';
 import type { Response } from 'express';
 import { GetUser } from 'src/auth/get-user.decorator';
 import { CapturePaypalOrderDto } from './dto/capture-paypal-order.dto';
+import { ConfirmCashPaymentDto } from './dto/confirm-cash-payment.dto';
 import { CreatePaypalOrderDto } from './dto/create-paypal-order.dto';
 import { PaymentsService } from './payments.service';
 
@@ -51,6 +52,15 @@ export class PaymentsController {
     @GetUser() user: User,
   ) {
     return this.paymentsService.capturePaypalOrder(user, dto.orderId);
+  }
+
+  @UseGuards(AuthGuard('jwt'))
+  @Post('cash/confirm')
+  confirmCashPayment(
+    @Body() dto: ConfirmCashPaymentDto,
+    @GetUser() user: User,
+  ) {
+    return this.paymentsService.confirmCashPayment(user, dto);
   }
 
   @UseGuards(AuthGuard('jwt'))

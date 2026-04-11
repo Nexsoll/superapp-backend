@@ -7,6 +7,7 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { BookingStatus, Currency, type User } from '@prisma/client';
 import { PrismaService } from 'prisma/prisma.service';
+import { ConfirmCashPaymentDto } from './dto/confirm-cash-payment.dto';
 import {
   CreatePaypalOrderDto,
   PaymentBookingType,
@@ -243,6 +244,245 @@ export class PaymentsService {
         bookingType: PaymentBookingType.PROPERTY,
         propertyId: context.propertyId,
         bookingIds: [context.bookingId],
+      },
+    };
+  }
+
+  async confirmCashPayment(user: User, dto: ConfirmCashPaymentDto) {
+    const referenceId = `CASH-${Date.now()}-${Math.floor(Math.random() * 1000)
+      .toString()
+      .padStart(3, '0')}`;
+
+    if (dto.bookingType == PaymentBookingType.HOTEL) {
+      if (!dto.bookingIds || dto.bookingIds.length == 0) {
+        throw new BadRequestException('Hotel booking ids are required');
+      }
+
+      const bookings = await this.prisma.booking.findMany({
+        where: {
+          id: { in: dto.bookingIds },
+          userId: user.id,
+          hotelId: { not: null },
+          status: BookingStatus.PENDING,
+        },
+        include: {
+          hotel: true,
+          room: true,
+        },
+      });
+
+      if (bookings.length !== dto.bookingIds.length) {
+        throw new BadRequestException(
+          'One or more hotel bookings are invalid or no longer pending',
+        );
+      }
+
+      const hotelId = bookings[0]?.hotelId;
+      if (!hotelId) {
+        throw new BadRequestException('Hotel booking context is invalid');
+      }
+
+      if (!bookings.every((booking) => booking.hotelId == hotelId)) {
+        throw new BadRequestException('Please confirm one hotel at a time');
+      }
+
+      const roomSubtotal = bookings.reduce(
+        (sum, booking) => sum + Number(booking.totalPrice),
+        0,
+      );
+      const nights = Math.max(
+        1,
+        Math.ceil(
+          (bookings[0].checkOut.getTime() - bookings[0].checkIn.getTime()) /
+            (1000 * 60 * 60 * 24),
+        ),
+      );
+      const roomCount = bookings.length;
+      const adults = dto.adults ?? roomCount * 2;
+      const children = dto.children ?? 0;
+      const extraAdults = Math.max(0, adults - roomCount * 2);
+      const guestCharge = ((extraAdults * 20) + (children * 10)) * nights;
+      const subtotalBeforeTax = roomSubtotal + guestCharge;
+      const taxes = subtotalBeforeTax * 0.10;
+      const serviceCharge = subtotalBeforeTax > 0 ? 25 : 0;
+      const amount = Number(
+        (subtotalBeforeTax + taxes + serviceCharge).toFixed(2),
+      );
+
+      await this.prisma.booking.updateMany({
+        where: {
+          id: { in: dto.bookingIds },
+          userId: user.id,
+          hotelId,
+          status: BookingStatus.PENDING,
+        },
+        data: {
+          status: BookingStatus.ACTIVE,
+        },
+      });
+
+      const firstBooking = bookings[0];
+      const hotel = firstBooking.hotel;
+      const rooms = bookings
+        .map((booking) => booking.room?.title || 'Room')
+        .filter(Boolean);
+
+      try {
+        await this.mailerService.sendBookingConfirmation({
+          email: user.email,
+          bookingReference: referenceId,
+          bookingType: 'hotel',
+          listingTitle: hotel?.title || 'Hotel Booking',
+          location: hotel?.address || '',
+          checkIn: firstBooking.checkIn.toLocaleDateString('en-US', {
+            month: 'short',
+            day: 'numeric',
+            year: 'numeric',
+          }),
+          checkOut: firstBooking.checkOut.toLocaleDateString('en-US', {
+            month: 'short',
+            day: 'numeric',
+            year: 'numeric',
+          }),
+          guests: adults + children,
+          rooms,
+          totalAmount: `$${amount.toFixed(2)}`,
+          paymentMethod: 'Cash Payment',
+        });
+      } catch (emailError) {
+        console.error('Failed to send confirmation email:', emailError);
+      }
+
+      await this.prisma.transaction.create({
+        data: {
+          userId: user.id,
+          type: 'BOOKING_PAYMENT',
+          amount,
+          description: `Cash payment for hotel booking at ${hotel?.title || 'Hotel'} (${referenceId})`,
+        },
+      });
+
+      return {
+        success: true,
+        message: 'Cash payment confirmed successfully',
+        payment: {
+          provider: 'cash',
+          referenceId,
+          status: 'CONFIRMED',
+        },
+        booking: {
+          bookingType: PaymentBookingType.HOTEL,
+          hotelId,
+          bookingIds: dto.bookingIds,
+        },
+      };
+    }
+
+    if (!dto.propertyId) {
+      throw new BadRequestException('Property id is required');
+    }
+
+    const property = await this.prisma.property.findUnique({
+      where: { id: dto.propertyId },
+    });
+
+    if (!property) {
+      throw new NotFoundException('Property not found');
+    }
+
+    const purchasePrice = Number(property.price);
+    const closingCosts = purchasePrice * 0.0148;
+    const agentFees = purchasePrice * 0.03;
+    const estimatedAmount = Number((purchasePrice + closingCosts + agentFees).toFixed(2));
+
+    let propertyBooking = await this.prisma.booking.findFirst({
+      where: {
+        userId: user.id,
+        propertyId: property.id,
+        status: BookingStatus.PENDING,
+      },
+      include: {
+        property: true,
+      },
+      orderBy: {
+        createdAt: 'desc',
+      },
+    });
+
+    if (propertyBooking) {
+      propertyBooking = await this.prisma.booking.update({
+        where: { id: propertyBooking.id },
+        data: { status: BookingStatus.ACTIVE },
+        include: {
+          property: true,
+        },
+      });
+    } else {
+      const checkIn = new Date();
+      const checkOut = new Date(checkIn.getTime() + 24 * 60 * 60 * 1000);
+      propertyBooking = await this.prisma.booking.create({
+        data: {
+          userId: user.id,
+          propertyId: property.id,
+          checkIn,
+          checkOut,
+          totalPrice: estimatedAmount,
+          status: BookingStatus.ACTIVE,
+        },
+        include: {
+          property: true,
+        },
+      });
+    }
+
+    const finalAmount = Number(propertyBooking.totalPrice);
+
+    try {
+      await this.mailerService.sendBookingConfirmation({
+        email: user.email,
+        bookingReference: referenceId,
+        bookingType: 'property',
+        listingTitle: propertyBooking.property?.title || 'Property Booking',
+        location: propertyBooking.property?.address || '',
+        checkIn: propertyBooking.checkIn.toLocaleDateString('en-US', {
+          month: 'short',
+          day: 'numeric',
+          year: 'numeric',
+        }),
+        checkOut: propertyBooking.checkOut.toLocaleDateString('en-US', {
+          month: 'short',
+          day: 'numeric',
+          year: 'numeric',
+        }),
+        totalAmount: `$${finalAmount.toFixed(2)}`,
+        paymentMethod: 'Cash Payment',
+      });
+    } catch (emailError) {
+      console.error('Failed to send confirmation email:', emailError);
+    }
+
+    await this.prisma.transaction.create({
+      data: {
+        userId: user.id,
+        bookingId: propertyBooking.id,
+        type: 'BOOKING_PAYMENT',
+        amount: finalAmount,
+        description: `Cash payment for property booking at ${propertyBooking.property?.title || 'Property'} (${referenceId})`,
+      },
+    });
+
+    return {
+      success: true,
+      message: 'Cash payment confirmed successfully',
+      payment: {
+        provider: 'cash',
+        referenceId,
+        status: 'CONFIRMED',
+      },
+      booking: {
+        bookingType: PaymentBookingType.PROPERTY,
+        propertyId: property.id,
+        bookingIds: [propertyBooking.id],
       },
     };
   }

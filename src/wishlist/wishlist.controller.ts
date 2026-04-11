@@ -61,4 +61,12 @@ export class WishlistController {
   ) {
     return this.wishlistService.isHotelInWishlist(user.id, +hotelId);
   }
+
+  @Get('property-cost-breakdown/:propertyId')
+  getPropertyCostBreakdown(
+    @Param('propertyId') propertyId: string,
+    @GetUser() user: User,
+  ) {
+    return this.wishlistService.getPropertyCostBreakdown(user.id, +propertyId);
+  }
 }
