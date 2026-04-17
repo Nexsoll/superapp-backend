@@ -519,11 +519,19 @@ export class ListingService {
     });
   }
 
-  async cancelBooking(bookingId: number, userId: number) {
+  async cancelBooking(bookingId: number, userId: number, isCashPayment = false) {
     const booking = await this.prisma.booking.findFirst({
       where: {
         id: bookingId,
         userId,
+      },
+      include: {
+        transactions: {
+          where: {
+            type: 'BOOKING_PAYMENT',
+          },
+          take: 1,
+        },
       },
     });
 
@@ -534,6 +542,10 @@ export class ListingService {
     if (booking.status === 'CANCELLED') {
       throw new BadRequestException('Booking is already cancelled');
     }
+
+    // Determine if this was a cash payment (no payment transaction means cash)
+    const hasPaymentTransaction = booking.transactions.length > 0;
+    const wasCashPayment = !hasPaymentTransaction;
 
     // Determine refund amount based on 24hr rule (relative to when booking was placed)
     const now = new Date();
@@ -557,15 +569,17 @@ export class ListingService {
         data: { status: 'CANCELLED' },
       });
 
-      // 2. Update user balance
-      await tx.user.update({
-        where: { id: userId },
-        data: {
-          balance: {
-            increment: refundAmount,
+      // 2. Update user balance (only for non-cash payments)
+      if (!wasCashPayment) {
+        await tx.user.update({
+          where: { id: userId },
+          data: {
+            balance: {
+              increment: refundAmount,
+            },
           },
-        },
-      });
+        });
+      }
 
       // 3. Create transaction record
       await tx.transaction.create({
@@ -574,9 +588,13 @@ export class ListingService {
           bookingId,
           type: 'BOOKING_REFUND',
           amount: refundAmount,
-          description: hoursDiff > 24 
-            ? `Refund for booking #${bookingId} (5% cancellation fee applied)` 
-            : `Full refund for booking #${bookingId}`,
+          description: wasCashPayment
+            ? (hoursDiff > 24 
+                ? `Cash refund initiated for booking #${bookingId} (5% cancellation fee applied)` 
+                : `Full cash refund initiated for booking #${bookingId}`)
+            : (hoursDiff > 24 
+                ? `Refund for booking #${bookingId} (5% cancellation fee applied)` 
+                : `Full refund for booking #${bookingId}`),
         },
       });
 
@@ -585,9 +603,10 @@ export class ListingService {
 
     return { 
       success: true, 
-      message: 'Booking cancelled successfully', 
+      message: 'Booking cancelled successfully',
       refundAmount: refundAmount.toFixed(2), 
       feeAmount: feeAmount.toFixed(2),
+      wasCashPayment,
       booking: result
     };
   }
