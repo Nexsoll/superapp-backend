@@ -20,8 +20,20 @@ export class StaffService {
         private notifications: NotificationsService
     ) { }
 
+    private async assertStaffAccess(userId: number) {
+        const staffMember = await this.prisma.staff.findUnique({
+            where: { userId },
+            select: { id: true },
+        });
+
+        if (!staffMember) {
+            throw new ForbiddenException('Only admin-assigned staff can access this dashboard');
+        }
+    }
+
     async getMyAssignedJobs(userId: number) {
         try {
+            await this.assertStaffAccess(userId);
             this.logger.log(`Fetching jobs for staff user ${userId}`);
 
             const jobs = await this.prisma.job.findMany({
@@ -55,12 +67,16 @@ export class StaffService {
             };
         } catch (error) {
             this.logger.error(`Failed to fetch assigned jobs for user ${userId}`, error.stack);
+            if (error instanceof ForbiddenException) {
+                throw error;
+            }
             throw new InternalServerErrorException('Failed to fetch assigned jobs');
         }
     }
 
     async acceptJob(jobId: number, userId: number) {
         try {
+            await this.assertStaffAccess(userId);
             const job = await this.prisma.job.findUnique({
                 where: { id: jobId },
                 include: { assignments: true },
@@ -108,6 +124,7 @@ export class StaffService {
 
     async submitJob(jobId: number, userId: number, beforeImage: string, afterImage: string) {
         try {
+            await this.assertStaffAccess(userId);
             const job = await this.prisma.job.findUnique({
                 where: { id: jobId },
                 include: { assignments: true },
@@ -157,6 +174,7 @@ export class StaffService {
 
     async rejectJob(jobId: number, userId: number) {
         try {
+            await this.assertStaffAccess(userId);
             const job = await this.prisma.job.findUnique({
                 where: { id: jobId },
                 include: { assignments: true },
@@ -205,6 +223,7 @@ export class StaffService {
 
     async getMyEarnings(userId: number) {
         try {
+            await this.assertStaffAccess(userId);
             const completedJobs = await this.prisma.job.findMany({
                 where: {
                     assignments: {
@@ -232,6 +251,9 @@ export class StaffService {
             };
         } catch (error) {
             this.logger.error(`Failed to calculate earnings for user ${userId}`, error.stack);
+            if (error instanceof ForbiddenException) {
+                throw error;
+            }
             throw new InternalServerErrorException('Failed to calculate earnings');
         }
     }
