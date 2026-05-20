@@ -139,7 +139,19 @@ export class LocalizationService {
 
   async resolveVisitorLocale(request: Request) {
     const ip = this.extractClientIp(request);
-    const geo = await this.resolveGeoFromProviders(ip);
+    const headerCountryCode = this.extractCountryCodeFromHeaders(request);
+    const preferredLanguage = this.extractPreferredLanguage(request);
+    let geo: GeoResult | null = null;
+
+    if (headerCountryCode) {
+      geo = {
+        source: 'edge-country-header',
+        countryCode: headerCountryCode,
+        languageCode: preferredLanguage,
+      };
+    } else if (ip) {
+      geo = await this.resolveGeoFromProviders(ip);
+    }
 
     if (!geo?.countryCode) {
       return {
@@ -154,7 +166,10 @@ export class LocalizationService {
       };
     }
 
-    const metadata = await this.resolveCountryMetadata(geo.countryCode, geo);
+    const metadata = await this.resolveCountryMetadata(geo.countryCode, {
+      ...geo,
+      languageCode: geo.languageCode || preferredLanguage,
+    });
 
     return {
       ...metadata,
@@ -192,13 +207,45 @@ export class LocalizationService {
       };
     }
 
+    const cloudTranslations = await this.translateWithGoogleCloud(
+      inputs,
+      normalizedTarget,
+      normalizedSource,
+    );
+    if (cloudTranslations.length === inputs.length) {
+      return {
+        targetLanguage: normalizedTarget,
+        sourceLanguage: normalizedSource,
+        translations: cloudTranslations,
+      };
+    }
+
+    const publicTranslations = await this.translateWithGooglePublic(
+      inputs,
+      normalizedTarget,
+      normalizedSource,
+    );
+
+    return {
+      targetLanguage: normalizedTarget,
+      sourceLanguage: normalizedSource,
+      translations: publicTranslations,
+    };
+  }
+
+  private async translateWithGoogleCloud(
+    inputs: string[],
+    targetLanguage: string,
+    sourceLanguage: string,
+  ) {
     try {
       const client = await this.googleAuth.getClient();
       const token = await client.getAccessToken();
       const accessToken = token.token;
 
       if (!accessToken) {
-        throw new BadRequestException('Google translation token is unavailable');
+        this.logger.warn('Google translation token is unavailable');
+        return [];
       }
 
       const response = await fetch(
@@ -211,8 +258,8 @@ export class LocalizationService {
           },
           body: JSON.stringify({
             q: inputs,
-            target: normalizedTarget,
-            source: normalizedSource,
+            target: targetLanguage,
+            source: sourceLanguage,
             format: 'text',
           }),
         },
@@ -220,39 +267,61 @@ export class LocalizationService {
 
       if (!response.ok) {
         const body = await response.text();
-        this.logger.error(`Google Translate error: ${response.status} ${body}`);
-        throw new BadRequestException('Failed to translate text');
+        this.logger.warn(`Google Translate cloud error: ${response.status} ${body}`);
+        return [];
       }
 
       const body = (await response.json()) as TranslationApiResponse;
-      const translated = (body.data?.translations ?? []).map((item) =>
+      return (body.data?.translations ?? []).map((item) =>
         (item.translatedText ?? '').toString(),
       );
-
-      if (translated.length !== inputs.length) {
-        this.logger.warn(
-          `Translation count mismatch: expected ${inputs.length}, got ${translated.length}`,
-        );
-        return {
-          targetLanguage: normalizedTarget,
-          sourceLanguage: normalizedSource,
-          translations: inputs,
-        };
-      }
-
-      return {
-        targetLanguage: normalizedTarget,
-        sourceLanguage: normalizedSource,
-        translations: translated,
-      };
     } catch (error) {
-      if (error instanceof BadRequestException) {
-        throw error;
-      }
-
-      this.logger.error(`Translation failed: ${error}`);
-      throw new BadRequestException('Translation service is unavailable');
+      this.logger.warn(`Google Translate cloud unavailable: ${error}`);
+      return [];
     }
+  }
+
+  private async translateWithGooglePublic(
+    inputs: string[],
+    targetLanguage: string,
+    sourceLanguage: string,
+  ) {
+    const translations: string[] = [];
+
+    for (const input of inputs) {
+      try {
+        const url = new URL('https://translate.googleapis.com/translate_a/single');
+        url.searchParams.set('client', 'gtx');
+        url.searchParams.set('sl', sourceLanguage);
+        url.searchParams.set('tl', targetLanguage);
+        url.searchParams.set('dt', 't');
+        url.searchParams.set('q', input);
+
+        const response = await fetch(url);
+        if (!response.ok) {
+          translations.push(input);
+          continue;
+        }
+
+        const decoded = (await response.json()) as unknown;
+        translations.push(this.extractPublicTranslation(decoded) || input);
+      } catch (error) {
+        this.logger.warn(`Google Translate public fallback failed: ${error}`);
+        translations.push(input);
+      }
+    }
+
+    return translations;
+  }
+
+  private extractPublicTranslation(decoded: unknown) {
+    if (!Array.isArray(decoded) || !Array.isArray(decoded[0])) return '';
+
+    return decoded[0]
+      .filter((segment): segment is unknown[] => Array.isArray(segment))
+      .map((segment) => String(segment[0] ?? ''))
+      .join('')
+      .trim();
   }
 
   private extractClientIp(request: Request) {
@@ -275,6 +344,39 @@ export class LocalizationService {
     return '';
   }
 
+  private extractCountryCodeFromHeaders(request: Request) {
+    const headerCandidates = [
+      request.headers['cf-ipcountry'],
+      request.headers['x-vercel-ip-country'],
+      request.headers['x-country-code'],
+      request.headers['cloudfront-viewer-country'],
+      request.headers['x-appengine-country'],
+    ];
+
+    for (const candidate of headerCandidates) {
+      const raw = Array.isArray(candidate) ? candidate[0] : candidate;
+      const code = raw?.trim().toUpperCase() || '';
+      if (!/^[A-Z]{2}$/.test(code)) continue;
+      if (code === 'XX' || code === 'ZZ' || code === 'T1') continue;
+      return code;
+    }
+
+    return '';
+  }
+
+  private extractPreferredLanguage(request: Request) {
+    const header = request.headers['accept-language'];
+    const raw = Array.isArray(header) ? header[0] : header;
+    if (!raw) return '';
+
+    const first = raw
+      .split(',')
+      .map((part) => part.split(';')[0]?.trim() || '')
+      .find(Boolean);
+
+    return this.normalizeLanguageCode(first);
+  }
+
   private cleanIp(ip?: string) {
     if (!ip) return '';
     return ip.trim().replace(/^::ffff:/, '').replace(/^\[|\]$/g, '');
@@ -292,7 +394,9 @@ export class LocalizationService {
   }
 
   private async resolveGeoFromProviders(ip: string): Promise<GeoResult | null> {
-    const encodedIp = ip ? encodeURIComponent(ip) : '';
+    if (!ip) return null;
+
+    const encodedIp = encodeURIComponent(ip);
     const providers = [
       () => this.geoFromIpWho(encodedIp),
       () => this.geoFromIpApi(encodedIp),
@@ -393,9 +497,9 @@ export class LocalizationService {
     const languages = country?.languages ?? {};
     const languageKey = Object.keys(languages)[0] || '';
     const countryLanguageCode =
-      geo.languageCode ||
-      iso639ThreeToGoogle[languageKey] ||
-      this.normalizeLanguageCode(languageKey);
+      this.normalizeLanguageCode(
+        geo.languageCode || iso639ThreeToGoogle[languageKey] || languageKey,
+      ) || 'en';
 
     return {
       countryCode: code,
@@ -423,7 +527,16 @@ export class LocalizationService {
   private normalizeLanguageCode(raw?: string) {
     const value = raw?.trim().toLowerCase() || '';
     if (!value) return '';
-    return value.split('-')[0];
+
+    const primary = value.split('-')[0];
+    if (!primary) return '';
+
+    if (primary.length === 3 && iso639ThreeToGoogle[primary]) {
+      return iso639ThreeToGoogle[primary];
+    }
+
+    if (!/^[a-z]{2,3}$/.test(primary)) return '';
+    return primary;
   }
 
   private async fetchJson(url: string, timeoutMs = 3500) {
