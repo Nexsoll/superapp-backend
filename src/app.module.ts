@@ -18,6 +18,7 @@ import { StaffModule } from './staff/staff.module';
 import { IoTModule } from './iot/iot.module';
 import { NotificationsModule } from './notifications/notifications.module';
 import { PaymentsModule } from './payments/payments.module';
+import { LocalizationModule } from './localization/localization.module';
 
 @Global()
 @Module({
@@ -41,9 +42,9 @@ import { PaymentsModule } from './payments/payments.module';
     IoTModule,
     NotificationsModule,
     PaymentsModule,
+    LocalizationModule,
   ],
   controllers: [AppController],
   providers: [AppService],
 })
 export class AppModule { }
-
