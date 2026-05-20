@@ -147,7 +147,6 @@ export class LocalizationService {
       geo = {
         source: 'edge-country-header',
         countryCode: headerCountryCode,
-        languageCode: preferredLanguage,
       };
     } else if (ip) {
       geo = await this.resolveGeoFromProviders(ip);
@@ -166,9 +165,12 @@ export class LocalizationService {
       };
     }
 
+    const preferredNonEnglish = preferredLanguage && preferredLanguage !== 'en'
+      ? preferredLanguage
+      : '';
     const metadata = await this.resolveCountryMetadata(geo.countryCode, {
       ...geo,
-      languageCode: geo.languageCode || preferredLanguage,
+      languageCode: geo.languageCode || preferredNonEnglish,
     });
 
     return {
@@ -495,11 +497,30 @@ export class LocalizationService {
       '';
     const currency = currencyCode ? currencies[currencyCode] : undefined;
     const languages = country?.languages ?? {};
-    const languageKey = Object.keys(languages)[0] || '';
+    const languageEntries = Object.entries(languages) as Array<[string, unknown]>;
+    const languageCandidates = languageEntries
+      .map(([key, value]) => ({
+        code: this.normalizeLanguageCode(iso639ThreeToGoogle[key] || key),
+        name: value?.toString() || '',
+      }))
+      .filter((entry) => Boolean(entry.code));
+    const preferredGeoLanguage = this.normalizeLanguageCode(geo.languageCode);
+    const preferredCandidate =
+      preferredGeoLanguage && preferredGeoLanguage !== 'en'
+        ? languageCandidates.find((entry) => entry.code === preferredGeoLanguage) || {
+            code: preferredGeoLanguage,
+            name: '',
+          }
+        : null;
+    const countryPreferredCandidate =
+      languageCandidates.find((entry) => entry.code !== 'en') ||
+      languageCandidates[0] ||
+      null;
+    const chosenLanguage = preferredCandidate || countryPreferredCandidate;
     const countryLanguageCode =
-      this.normalizeLanguageCode(
-        geo.languageCode || iso639ThreeToGoogle[languageKey] || languageKey,
-      ) || 'en';
+      chosenLanguage?.code || 'en';
+    const countryLanguageName =
+      chosenLanguage?.name || countryLanguageCode;
 
     return {
       countryCode: code,
@@ -511,10 +532,7 @@ export class LocalizationService {
       currencyName: currency?.name?.toString() || '',
       currencySymbol: currency?.symbol?.toString() || currencyCode,
       languageCode: countryLanguageCode,
-      languageName:
-        languageKey && languages[languageKey]
-          ? languages[languageKey].toString()
-          : countryLanguageCode,
+      languageName: countryLanguageName,
     };
   }
 
