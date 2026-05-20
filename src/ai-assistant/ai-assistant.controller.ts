@@ -38,6 +38,11 @@ export class AiAssistantController {
     return this.aiAssistantService.chat(user.id, dto.message);
   }
 
+  @Post('chat-guest')
+  async chatGuest(@Body() dto: ChatMessageDto) {
+    return this.aiAssistantService.chat(0, dto.message);
+  }
+
   @Post('transcribe')
   @UseGuards(AuthGuard('jwt'))
   @UseInterceptors(
@@ -48,6 +53,34 @@ export class AiAssistantController {
     }),
   )
   async transcribe(
+    @UploadedFile()
+    file?: Express.Multer.File,
+  ) {
+    if (!file) {
+      throw new BadRequestException('Audio file is required');
+    }
+
+    if (!file.buffer || file.buffer.length === 0) {
+      throw new BadRequestException('Audio file is empty');
+    }
+
+    const text = await this.aiAssistantService.transcribeAudio({
+      audioBuffer: file.buffer,
+      mimeType: file.mimetype,
+    });
+
+    return { text };
+  }
+
+  @Post('transcribe-guest')
+  @UseInterceptors(
+    FileInterceptor('audio', {
+      limits: {
+        fileSize: 10 * 1024 * 1024,
+      },
+    }),
+  )
+  async transcribeGuest(
     @UploadedFile()
     file?: Express.Multer.File,
   ) {
