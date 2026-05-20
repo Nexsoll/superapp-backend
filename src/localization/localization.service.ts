@@ -214,7 +214,10 @@ export class LocalizationService {
       normalizedTarget,
       normalizedSource,
     );
-    if (cloudTranslations.length === inputs.length) {
+    if (
+      cloudTranslations.length === inputs.length &&
+      this.hasMeaningfulTranslations(inputs, cloudTranslations)
+    ) {
       return {
         targetLanguage: normalizedTarget,
         sourceLanguage: normalizedSource,
@@ -228,10 +231,21 @@ export class LocalizationService {
       normalizedSource,
     );
 
+    if (
+      publicTranslations.length === inputs.length &&
+      this.hasMeaningfulTranslations(inputs, publicTranslations)
+    ) {
+      return {
+        targetLanguage: normalizedTarget,
+        sourceLanguage: normalizedSource,
+        translations: publicTranslations,
+      };
+    }
+
     return {
       targetLanguage: normalizedTarget,
       sourceLanguage: normalizedSource,
-      translations: publicTranslations,
+      translations: inputs,
     };
   }
 
@@ -288,32 +302,53 @@ export class LocalizationService {
     targetLanguage: string,
     sourceLanguage: string,
   ) {
-    const translations: string[] = [];
+    if (inputs.length === 0) return [];
 
-    for (const input of inputs) {
-      try {
-        const url = new URL('https://translate.googleapis.com/translate_a/single');
-        url.searchParams.set('client', 'gtx');
-        url.searchParams.set('sl', sourceLanguage);
-        url.searchParams.set('tl', targetLanguage);
-        url.searchParams.set('dt', 't');
-        url.searchParams.set('q', input);
+    const separator = '[[[IDS_SPLIT_1X9Z]]]';
+    const combinedInput = inputs.join(separator);
 
-        const response = await fetch(url);
-        if (!response.ok) {
-          translations.push(input);
-          continue;
-        }
+    try {
+      const url = new URL('https://translate.googleapis.com/translate_a/single');
+      url.searchParams.set('client', 'gtx');
+      url.searchParams.set('sl', sourceLanguage);
+      url.searchParams.set('tl', targetLanguage);
+      url.searchParams.set('dt', 't');
+      url.searchParams.set('q', combinedInput);
 
-        const decoded = (await response.json()) as unknown;
-        translations.push(this.extractPublicTranslation(decoded) || input);
-      } catch (error) {
-        this.logger.warn(`Google Translate public fallback failed: ${error}`);
-        translations.push(input);
+      const response = await fetch(url, {
+        headers: {
+          Accept: 'application/json',
+          'User-Agent': 'ids-europe-localization/1.0',
+        },
+      });
+      if (!response.ok) {
+        this.logger.warn(`Google Translate public error: ${response.status}`);
+        return [];
       }
-    }
 
-    return translations;
+      const decoded = (await response.json()) as unknown;
+      const translatedCombined = this.extractPublicTranslation(decoded);
+      if (!translatedCombined) return [];
+
+      const translations = translatedCombined
+        .split(separator)
+        .map((item) => item.trim());
+      if (translations.length !== inputs.length) {
+        this.logger.warn(
+          `Google Translate public split mismatch: expected ${inputs.length}, got ${translations.length}`,
+        );
+        return [];
+      }
+
+      if (!this.hasMeaningfulTranslations(inputs, translations)) {
+        return [];
+      }
+
+      return translations;
+    } catch (error) {
+      this.logger.warn(`Google Translate public fallback failed: ${error}`);
+      return [];
+    }
   }
 
   private extractPublicTranslation(decoded: unknown) {
@@ -324,6 +359,26 @@ export class LocalizationService {
       .map((segment) => String(segment[0] ?? ''))
       .join('')
       .trim();
+  }
+
+  private hasMeaningfulTranslations(inputs: string[], translations: string[]) {
+    if (inputs.length !== translations.length) return false;
+
+    let changedCount = 0;
+    for (let i = 0; i < inputs.length; i++) {
+      const source = this.normalizeComparableText(inputs[i]);
+      const translated = this.normalizeComparableText(translations[i]);
+      if (!translated) continue;
+      if (source != translated) {
+        changedCount += 1;
+      }
+    }
+
+    return changedCount > 0;
+  }
+
+  private normalizeComparableText(value: string) {
+    return value.toLowerCase().replace(/\s+/g, ' ').trim();
   }
 
   private extractClientIp(request: Request) {
