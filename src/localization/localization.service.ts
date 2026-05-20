@@ -1,4 +1,5 @@
 import { BadRequestException, Injectable, Logger } from '@nestjs/common';
+import type { Request } from 'express';
 import { GoogleAuth } from 'google-auth-library';
 
 type TranslationApiResponse = {
@@ -9,12 +10,158 @@ type TranslationApiResponse = {
   };
 };
 
+type GeoResult = {
+  source: string;
+  ip?: string;
+  countryCode?: string;
+  countryName?: string;
+  currencyCode?: string;
+  languageCode?: string;
+};
+
+type CountryMetadata = {
+  countryCode: string;
+  countryName: string;
+  currencyCode?: string;
+  currencyName?: string;
+  currencySymbol?: string;
+  languageCode?: string;
+  languageName?: string;
+};
+
+const iso639ThreeToGoogle: Record<string, string> = {
+  afr: 'af',
+  amh: 'am',
+  ara: 'ar',
+  aym: 'ay',
+  aze: 'az',
+  bel: 'be',
+  ben: 'bn',
+  bis: 'bi',
+  bos: 'bs',
+  bul: 'bg',
+  cat: 'ca',
+  ces: 'cs',
+  ckb: 'ckb',
+  dan: 'da',
+  deu: 'de',
+  div: 'dv',
+  ell: 'el',
+  eng: 'en',
+  est: 'et',
+  fas: 'fa',
+  fin: 'fi',
+  fra: 'fr',
+  gle: 'ga',
+  glv: 'gv',
+  grn: 'gn',
+  hat: 'ht',
+  heb: 'he',
+  hin: 'hi',
+  hrv: 'hr',
+  hun: 'hu',
+  hye: 'hy',
+  ind: 'id',
+  isl: 'is',
+  ita: 'it',
+  jpn: 'ja',
+  kal: 'kl',
+  kat: 'ka',
+  kaz: 'kk',
+  khm: 'km',
+  kir: 'ky',
+  kor: 'ko',
+  lao: 'lo',
+  lat: 'la',
+  lav: 'lv',
+  lit: 'lt',
+  ltz: 'lb',
+  mah: 'mh',
+  mkd: 'mk',
+  mlg: 'mg',
+  mlt: 'mt',
+  mon: 'mn',
+  msa: 'ms',
+  mya: 'my',
+  nau: 'na',
+  nep: 'ne',
+  nld: 'nl',
+  nor: 'no',
+  nya: 'ny',
+  pap: 'pap',
+  pol: 'pl',
+  por: 'pt',
+  pus: 'ps',
+  que: 'qu',
+  rar: 'rar',
+  ron: 'ro',
+  run: 'rn',
+  rus: 'ru',
+  sag: 'sg',
+  sin: 'si',
+  slk: 'sk',
+  slv: 'sl',
+  smo: 'sm',
+  sna: 'sn',
+  som: 'so',
+  sot: 'st',
+  spa: 'es',
+  sqi: 'sq',
+  srp: 'sr',
+  swa: 'sw',
+  swe: 'sv',
+  tam: 'ta',
+  tet: 'tet',
+  tgk: 'tg',
+  tha: 'th',
+  tir: 'ti',
+  ton: 'to',
+  tpi: 'tpi',
+  tuk: 'tk',
+  tur: 'tr',
+  tvl: 'tvl',
+  ukr: 'uk',
+  urd: 'ur',
+  uzb: 'uz',
+  vie: 'vi',
+  xho: 'xh',
+  zdj: 'zdj',
+  zho: 'zh',
+  zul: 'zu',
+};
+
 @Injectable()
 export class LocalizationService {
   private readonly logger = new Logger(LocalizationService.name);
   private readonly googleAuth = new GoogleAuth({
     scopes: ['https://www.googleapis.com/auth/cloud-translation'],
   });
+
+  async resolveVisitorLocale(request: Request) {
+    const ip = this.extractClientIp(request);
+    const geo = await this.resolveGeoFromProviders(ip);
+
+    if (!geo?.countryCode) {
+      return {
+        countryCode: '',
+        countryName: '',
+        currencyCode: '',
+        currencyName: '',
+        currencySymbol: '',
+        languageCode: '',
+        languageName: '',
+        source: 'unresolved',
+      };
+    }
+
+    const metadata = await this.resolveCountryMetadata(geo.countryCode, geo);
+
+    return {
+      ...metadata,
+      ip: geo.ip || ip || '',
+      source: geo.source,
+    };
+  }
 
   async translateTexts(params: {
     texts: string[];
@@ -105,6 +252,199 @@ export class LocalizationService {
 
       this.logger.error(`Translation failed: ${error}`);
       throw new BadRequestException('Translation service is unavailable');
+    }
+  }
+
+  private extractClientIp(request: Request) {
+    const headerCandidates = [
+      request.headers['cf-connecting-ip'],
+      request.headers['x-real-ip'],
+      request.headers['x-forwarded-for'],
+      request.ip,
+      request.socket?.remoteAddress,
+    ];
+
+    for (const candidate of headerCandidates) {
+      const raw = Array.isArray(candidate) ? candidate[0] : candidate;
+      const ip = this.cleanIp(raw?.split(',')[0]);
+      if (ip && !this.isPrivateIp(ip)) {
+        return ip;
+      }
+    }
+
+    return '';
+  }
+
+  private cleanIp(ip?: string) {
+    if (!ip) return '';
+    return ip.trim().replace(/^::ffff:/, '').replace(/^\[|\]$/g, '');
+  }
+
+  private isPrivateIp(ip: string) {
+    return (
+      ip === '::1' ||
+      ip === '127.0.0.1' ||
+      ip.startsWith('10.') ||
+      ip.startsWith('192.168.') ||
+      /^172\.(1[6-9]|2\d|3[01])\./.test(ip) ||
+      /^fc|^fd/i.test(ip)
+    );
+  }
+
+  private async resolveGeoFromProviders(ip: string): Promise<GeoResult | null> {
+    const encodedIp = ip ? encodeURIComponent(ip) : '';
+    const providers = [
+      () => this.geoFromIpWho(encodedIp),
+      () => this.geoFromIpApi(encodedIp),
+      () => this.geoFromIpApiCo(encodedIp),
+      () => this.geoFromIpInfo(encodedIp),
+    ];
+
+    for (const provider of providers) {
+      try {
+        const result = await provider();
+        if (result?.countryCode) return result;
+      } catch (error) {
+        this.logger.warn(`Geo provider failed: ${error}`);
+      }
+    }
+
+    return null;
+  }
+
+  private async geoFromIpWho(encodedIp: string): Promise<GeoResult | null> {
+    const data = await this.fetchJson(
+      `https://ipwho.is/${encodedIp}`,
+    ) as Record<string, any>;
+    if (data?.success === false) return null;
+
+    return {
+      source: 'ipwho.is',
+      ip: data?.ip?.toString(),
+      countryCode: data?.country_code?.toString(),
+      countryName: data?.country?.toString(),
+      currencyCode: data?.currency?.code?.toString(),
+      languageCode: this.normalizeLanguageCode(data?.languages?.[0]?.code),
+    };
+  }
+
+  private async geoFromIpApi(encodedIp: string): Promise<GeoResult | null> {
+    const path = encodedIp ? `/${encodedIp}` : '';
+    const data = await this.fetchJson(
+      `http://ip-api.com/json${path}?fields=status,message,query,country,countryCode,currency`,
+    ) as Record<string, any>;
+    if (data?.status !== 'success') return null;
+
+    return {
+      source: 'ip-api.com',
+      ip: data?.query?.toString(),
+      countryCode: data?.countryCode?.toString(),
+      countryName: data?.country?.toString(),
+      currencyCode: data?.currency?.toString(),
+    };
+  }
+
+  private async geoFromIpApiCo(encodedIp: string): Promise<GeoResult | null> {
+    const path = encodedIp ? `/${encodedIp}/json/` : '/json/';
+    const data = await this.fetchJson(
+      `https://ipapi.co${path}`,
+    ) as Record<string, any>;
+    if (data?.error) return null;
+
+    return {
+      source: 'ipapi.co',
+      ip: data?.ip?.toString(),
+      countryCode: data?.country_code?.toString(),
+      countryName: data?.country_name?.toString(),
+      currencyCode: data?.currency?.toString(),
+      languageCode: this.firstLanguage(data?.languages?.toString()),
+    };
+  }
+
+  private async geoFromIpInfo(encodedIp: string): Promise<GeoResult | null> {
+    const path = encodedIp ? `/${encodedIp}` : '';
+    const data = await this.fetchJson(
+      `https://ipinfo.io${path}/json`,
+    ) as Record<string, any>;
+
+    return {
+      source: 'ipinfo.io',
+      ip: data?.ip?.toString(),
+      countryCode: data?.country?.toString(),
+      countryName: data?.country?.toString(),
+    };
+  }
+
+  private async resolveCountryMetadata(
+    countryCode: string,
+    geo: GeoResult,
+  ): Promise<CountryMetadata> {
+    const code = countryCode.trim().toUpperCase();
+    const data = await this.fetchJson(
+      `https://restcountries.com/v3.1/alpha/${encodeURIComponent(code)}?fields=name,cca2,currencies,languages`,
+    ) as any;
+    const country = Array.isArray(data) ? data[0] : data;
+    const currencies = country?.currencies ?? {};
+    const currencyCode =
+      geo.currencyCode?.trim().toUpperCase() ||
+      Object.keys(currencies)[0]?.toUpperCase() ||
+      '';
+    const currency = currencyCode ? currencies[currencyCode] : undefined;
+    const languages = country?.languages ?? {};
+    const languageKey = Object.keys(languages)[0] || '';
+    const countryLanguageCode =
+      geo.languageCode ||
+      iso639ThreeToGoogle[languageKey] ||
+      this.normalizeLanguageCode(languageKey);
+
+    return {
+      countryCode: code,
+      countryName:
+        country?.name?.common?.toString() ||
+        geo.countryName ||
+        code,
+      currencyCode,
+      currencyName: currency?.name?.toString() || '',
+      currencySymbol: currency?.symbol?.toString() || currencyCode,
+      languageCode: countryLanguageCode,
+      languageName:
+        languageKey && languages[languageKey]
+          ? languages[languageKey].toString()
+          : countryLanguageCode,
+    };
+  }
+
+  private firstLanguage(raw?: string) {
+    if (!raw) return '';
+    const first = raw.split(',').map((item) => item.trim()).find(Boolean);
+    return this.normalizeLanguageCode(first);
+  }
+
+  private normalizeLanguageCode(raw?: string) {
+    const value = raw?.trim().toLowerCase() || '';
+    if (!value) return '';
+    return value.split('-')[0];
+  }
+
+  private async fetchJson(url: string, timeoutMs = 3500) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(url, {
+        signal: controller.signal,
+        headers: {
+          Accept: 'application/json',
+          'User-Agent': 'ids-europe-localization/1.0',
+        },
+      });
+
+      if (!response.ok) {
+        throw new Error(`${response.status} ${response.statusText}`);
+      }
+
+      return response.json();
+    } finally {
+      clearTimeout(timeout);
     }
   }
 }

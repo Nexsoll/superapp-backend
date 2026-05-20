@@ -1,4 +1,5 @@
-import { Body, Controller, Post } from '@nestjs/common';
+import { Body, Controller, Get, Post, Req } from '@nestjs/common';
+import type { Request } from 'express';
 import { LocalizationService } from './localization.service';
 import { TranslateTextDto } from './dto/translate-text.dto';
 
@@ -14,5 +15,9 @@ export class LocalizationController {
       sourceLanguage: dto.sourceLanguage,
     });
   }
-}
 
+  @Get('visitor-locale')
+  async getVisitorLocale(@Req() request: Request) {
+    return this.localizationService.resolveVisitorLocale(request);
+  }
+}
